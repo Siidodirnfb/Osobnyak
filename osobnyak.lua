@@ -1,77 +1,66 @@
 --[[
 	MansionBuilder — локальный скрипт (LocalScript)
 	=================================================================
-	Строит детализированный особняк с интерьром вокруг позиции игрока
+	Строит детализированный особняк с интерьером вокруг позиции игрока
 	Prime_Neuer (если его в игре нет — вокруг текущего персонажа).
 
 	Скрипт состоит только из вызовов одного ремоута с разными аргументами:
+		Change:InvokeServer("Place", hitPos, cameraCFrame, blockName, normal, "H", nil)
+	(если Change — RemoteEvent, используется FireServer с теми же аргументами).
 
-		game:GetService("ReplicatedStorage").Remotes.Change:InvokeServer(
-			"Place", hitPos, cameraCFrame, blockName, normal, "H", nil)
-
-	Аргументы вычисляются по обратной математике оригинального клиента:
-	сервер принимает hitPos + normal*1.51, привязывает к сетке 3x3x3 и
-	поворачивает блок по yaw камеры, поэтому здесь мы подаём те значения,
-	которые дают ровно нужный итоговый CFrame.
+	Защита от «застревания»:
+	* все WaitForChild — с таймаутом (не висит вечно, а падает с понятной ошибкой);
+	* каждый вызов ремоута — в pcall: один битый блок не убивает всю стройку,
+	  счётчики успешно/ошибок печатаются после каждой секции;
+	* ответ сервера "Limit"/"Height" останавливает стройку сразу с варнингом;
+	* стройка идёт по секциям step("имя", ...): видно, где скрипт находится.
+	  Достройка части: RUN.all=false и включите нужные секции, например:
+		local RUN = { all = false, roof = true, furniture1 = true }
 	=================================================================
 ]]
 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 
-local Change = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("Change")
+local Remotes = ReplicatedStorage:WaitForChild("Remotes", 15)
+assert(Remotes, "[Mansion] нет ReplicatedStorage.Remotes — скрипт остановлен")
+local Change = Remotes:WaitForChild("Change", 15)
+assert(Change, "[Mansion] нет ReplicatedStorage.Remotes.Change — скрипт остановлен")
+local IS_FUNC = Change:IsA("RemoteFunction")
+print(("[Mansion] remote: %s (%s)"):format(
+	Change:GetFullName(), if IS_FUNC then "RemoteFunction" else "RemoteEvent"))
+
 local NORMAL = Vector3.new(0, 1, 0)
 local PI = math.pi
 local TARGET_NAME = "Prime_Neuer"
 
---------------------------------------------------------------------------
--- 0. Параллельные вызовы ремоута (семафор)
---------------------------------------------------------------------------
--- Change — это RemoteFunction: каждый InvokeServer усыпляет свою корутину
--- до ответа сервера, то есть время последовательного цикла = N x RTT.
--- При 4000 блоках и RTT 100 мс это ~7 минут. Семафор держит до
--- MAX_IN_FLIGHT вызовов в полёте одновременно: волна уходит в сеть за один
--- тик, а round-trips накладываются друг на друга вместо суммирования.
--- Выигрыш ~= MAX_IN_FLIGHT раз.
---
--- Если сервер начнёт рate-лимитить или кикать за спам — опусти константу:
--- 64 -> 32 -> 16. Больше в скрипте ничего крутить не нужно.
+-- выборочный прогон секций (для достройки)
+local RUN = { all = true }
 
-local MAX_IN_FLIGHT = 64
-local inFlight = 0
-local failed = 0
-local slot = Instance.new("BindableEvent")
+local sent, okCount, failCount, aborted = 0, 0, 0, false
+local bad, failLog = 0, 0
 
---- Отправляет блок и сразу возвращает управление: ждёт только свободного
---- слота, а не ответа сервера на этот конкретный блок.
-local function invokePlace(hitPos: Vector3, cameraCFrame: CFrame, name: string)
-	while inFlight >= MAX_IN_FLIGHT do
-		slot.Event:Wait()
+local function sendPlace(hitPos, cameraCFrame, name)
+	if IS_FUNC then
+		return pcall(Change.InvokeServer, Change,
+			"Place", hitPos, cameraCFrame, name, NORMAL, "H", nil)
+	else
+		local ok = pcall(Change.FireServer, Change,
+			"Place", hitPos, cameraCFrame, name, NORMAL, "H", nil)
+		return ok, true
 	end
-
-	inFlight += 1
-	task.spawn(function()
-		-- pcall обязателен: упавший вызов иначе никогда не декрементирует
-		-- счётчик и весь скрипт зависнет молча на очередном слоте.
-		local ok, err = pcall(function()
-			Change:InvokeServer("Place", hitPos, cameraCFrame, name, NORMAL, "H", nil)
-		end)
-		if not ok then
-			failed += 1
-			if failed <= 5 then
-				warn(("[Mansion] вызов ремоута упал: %s"):format(tostring(err)))
-			end
-		end
-		inFlight -= 1
-		slot:Fire()
-	end)
 end
 
---- Ждёт, пока сервер ответит на все уже отправленные блоки.
-local function drain()
-	while inFlight > 0 do
-		slot.Event:Wait()
+local order = 0
+local function step(name, fn)
+	order += 1
+	if not (RUN.all or RUN[name]) then
+		print(("[Mansion] [%02d] %s — пропуск"):format(order, name))
+		return
 	end
+	print(("[Mansion] [%02d] %s ..."):format(order, name))
+	fn()
+	print(("[Mansion] [%02d] %s ok (успешно=%d ошибок=%d)"):format(order, name, okCount, failCount))
 end
 
 --------------------------------------------------------------------------
@@ -108,11 +97,11 @@ local function dims(name: string): (number, number)
 	return H, D
 end
 
-local placed = 0
-local bad = 0
-
---- Один блок = один вызов ремоута, но асинхронный (см. семафор в п. 0).
+--- Один вызов ремоута = один блок. Ошибки не роняют стройку.
 local function place(name: string, x: number, y: number, z: number, yaw: number?)
+	if aborted then
+		return
+	end
 	yaw = yaw or 0
 	local H, D = dims(name)
 	local special = isSpecial(name)
@@ -143,11 +132,25 @@ local function place(name: string, x: number, y: number, z: number, yaw: number?
 		end
 	end
 
-	invokePlace(hitPos, cameraCFrame, name)
+	local ok, res = sendPlace(hitPos, cameraCFrame, name)
+	sent += 1
+	if ok and (res == true or res == nil) then
+		okCount += 1
+	else
+		failCount += 1
+		if failLog < 12 then
+			failLog += 1
+			warn(("[Mansion] блок не встал: %s (ответ: %s)"):format(name, tostring(res)))
+		end
+		if res == "Limit" or res == "Height" then
+			aborted = true
+			warn(("[Mansion] СТОП: сервер ответил " .. tostring(res)))
+			return
+		end
+	end
 
-	placed += 1
-	if placed % 500 == 0 then
-		print(("[Mansion] %d блоков... (%d в полёте)"):format(placed, inFlight))
+	if sent % 50 == 0 then
+		task.wait()
 	end
 end
 
@@ -172,20 +175,31 @@ local function waitForCharacter(player: any, timeout: number): Model?
 end
 
 local target = Players:FindFirstChild(TARGET_NAME)
-local char: Model? = waitForCharacter(target, 20) or waitForCharacter(lp, 10)
-if not char then
-	error("[Mansion] персонаж не найден — скрипт остановлен")
-end
-
-local hrp: BasePart? = char:WaitForChild("HumanoidRootPart", 10) :: BasePart?
-if not hrp then
-	local alt: Model? = waitForCharacter(lp, 10)
-	if alt then
-		hrp = alt:WaitForChild("HumanoidRootPart") :: BasePart?
+local char: Model? = waitForCharacter(target, 5)
+if char then
+	print(("[Mansion] строим вокруг %s"):format(TARGET_NAME))
+else
+	print(("[Mansion] %s нет в игре — строим вокруг себя"):format(TARGET_NAME))
+	while not char do
+		char = waitForCharacter(lp, 60)
+		if not char then
+			print("[Mansion] всё ещё жду появления персонажа...")
+		end
 	end
 end
-if not hrp then
-	error("[Mansion] HumanoidRootPart не найден — скрипт остановлен")
+assert(char, "[Mansion] персонаж не найден — скрипт остановлен")
+
+local hrp: BasePart? = nil
+while not hrp do
+	hrp = char:WaitForChild("HumanoidRootPart", 15) :: BasePart?
+	if not hrp then
+		print("[Mansion] жду HumanoidRootPart...")
+		local alt: Model? = waitForCharacter(lp, 30)
+		if alt and alt ~= char then
+			char = alt
+		end
+		task.wait(1)
+	end
 end
 
 local exclude: { Instance } = { char }
@@ -316,7 +330,9 @@ local function groundFloorMat(i: number, j: number)
 	return "Oak Planks"
 end
 
-fill(0, 0, 32, 26, Y_FLOOR, groundFloorMat)
+step("floor1", function()
+	fill(0, 0, 32, 26, Y_FLOOR, groundFloorMat)
+end)
 
 --------------------------------------------------------------------------
 -- 5. Наружные стены 1 этажа
@@ -367,79 +383,84 @@ local function extBack1(j: number, k: number)
 	return "White Brick"
 end
 
-wallX(0, 0, 32, 0, 3, yW1, extLong)   -- южный фасад
-wallX(26, 0, 32, 0, 3, yW1, extLong)  -- северный фасад
-wallZ(0, 1, 25, 0, 3, yW1, extFront1) -- западный фасад (вход)
-wallZ(32, 1, 25, 0, 3, yW1, extBack1) -- восточный фасад
-
-doorAt(0, 13, Y_DOOR1, -PI / 2) -- входная дверь, лицом наружу
+step("extwalls1", function()
+	wallX(0, 0, 32, 0, 3, yW1, extLong)   -- южный фасад
+	wallX(26, 0, 32, 0, 3, yW1, extLong)  -- северный фасад
+	wallZ(0, 1, 25, 0, 3, yW1, extFront1) -- западный фасад (вход)
+	wallZ(32, 1, 25, 0, 3, yW1, extBack1) -- восточный фасад
+	doorAt(0, 13, Y_DOOR1, -PI / 2) -- входная дверь, лицом наружу
+end)
 
 --------------------------------------------------------------------------
 -- 6. Внутренние стены 1 этажа
 --------------------------------------------------------------------------
 
--- продольный разрез i = 10 (холл / средний блок)
-wallZ(10, 1, 25, 0, 3, yW1, function(j, k)
-	if (j == 8 or j == 18) and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(j, k)
-end)
-doorAt(10, 8, Y_DOOR1, PI / 2)
-doorAt(10, 18, Y_DOOR1, PI / 2)
+step("intwalls1", function()
+	-- продольный разрез i = 10 (холл / средний блок)
+	wallZ(10, 1, 25, 0, 3, yW1, function(j, k)
+		if (j == 8 or j == 18) and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(j, k)
+	end)
+	doorAt(10, 8, Y_DOOR1, PI / 2)
+	doorAt(10, 18, Y_DOOR1, PI / 2)
 
--- продольный разрез i = 22 (средний блок / восточный блок)
-wallZ(22, 1, 25, 0, 3, yW1, function(j, k)
-	if (j == 8 or j == 18) and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(j, k)
-end)
-doorAt(22, 8, Y_DOOR1, PI / 2)
-doorAt(22, 18, Y_DOOR1, PI / 2)
+	-- продольный разрез i = 22 (средний блок / восточный блок)
+	wallZ(22, 1, 25, 0, 3, yW1, function(j, k)
+		if (j == 8 or j == 18) and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(j, k)
+	end)
+	doorAt(22, 8, Y_DOOR1, PI / 2)
+	doorAt(22, 18, Y_DOOR1, PI / 2)
 
--- поперечная стена j = 13 в среднем блоке
-wallX(13, 11, 21, 0, 3, yW1, function(i, k)
-	if i == 16 and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(i, k)
-end)
-doorAt(16, 13, Y_DOOR1, 0)
+	-- поперечная стена j = 13 в среднем блоке
+	wallX(13, 11, 21, 0, 3, yW1, function(i, k)
+		if i == 16 and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(i, k)
+	end)
+	doorAt(16, 13, Y_DOOR1, 0)
 
--- поперечная стена j = 13 в восточном блоке (широкая арка)
-wallX(13, 23, 31, 0, 3, yW1, function(i, k)
-	if (i == 26 or i == 27) and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(i, k)
-end)
+	-- поперечная стена j = 13 в восточном блоке (широкая арка)
+	wallX(13, 23, 31, 0, 3, yW1, function(i, k)
+		if (i == 26 or i == 27) and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(i, k)
+	end)
 
--- перегородки западного блоке (кабинет / санузел)
-wallX(6, 1, 9, 0, 3, yW1, function(i, k)
-	if i == 5 and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(i, k)
-end)
-doorAt(5, 6, Y_DOOR1, 0)
+	-- перегородки западного блока (кабинет / санузел)
+	wallX(6, 1, 9, 0, 3, yW1, function(i, k)
+		if i == 5 and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(i, k)
+	end)
+	doorAt(5, 6, Y_DOOR1, 0)
 
-wallX(20, 1, 9, 0, 3, yW1, function(i, k)
-	if i == 5 and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(i, k)
+	wallX(20, 1, 9, 0, 3, yW1, function(i, k)
+		if i == 5 and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(i, k)
+	end)
+	doorAt(5, 20, Y_DOOR1, 0)
 end)
-doorAt(5, 20, Y_DOOR1, 0)
 
 --------------------------------------------------------------------------
 -- 7. Лестница 1 -> 2 этаж (подъём в +X по холлу, j = 13)
 --------------------------------------------------------------------------
 
-for n = 0, 4 do
-	local y = if n < 4 then yW1(n) else Y_SLAB2
-	place("Oak Stairs", cx(3 + n), y, cz(13), PI)
-end
+step("stairs", function()
+	for n = 0, 4 do
+		local y = if n < 4 then yW1(n) else Y_SLAB2
+		place("Oak Stairs", cx(3 + n), y, cz(13), PI)
+	end
+end)
 
 --------------------------------------------------------------------------
 -- 8. Перекрытие 2 этажа (с проёмом под лестницу)
@@ -458,11 +479,13 @@ local function slab2Mat(i: number, j: number)
 	return "Oak Planks"
 end
 
-fill(0, 0, 32, 26, Y_SLAB2, function(i, j)
-	if j == 13 and (i == 5 or i == 6 or i == 7) then
-		return nil -- лестничный проём
-	end
-	return slab2Mat(i, j)
+step("floor2", function()
+	fill(0, 0, 32, 26, Y_SLAB2, function(i, j)
+		if j == 13 and (i == 5 or i == 6 or i == 7) then
+			return nil -- лестничный проём
+		end
+		return slab2Mat(i, j)
+	end)
 end)
 
 --------------------------------------------------------------------------
@@ -495,65 +518,68 @@ local function extBack2(j: number, k: number)
 	return "White Brick"
 end
 
-wallX(0, 0, 32, 0, 3, yW2, extLong)
-wallX(26, 0, 32, 0, 3, yW2, extLong)
-wallZ(0, 1, 25, 0, 3, yW2, extFront2)
-wallZ(32, 1, 25, 0, 3, yW2, extBack2)
-
-doorAt(32, 13, Y_DOOR2, PI / 2) -- дверь на балкон
+step("extwalls2", function()
+	wallX(0, 0, 32, 0, 3, yW2, extLong)
+	wallX(26, 0, 32, 0, 3, yW2, extLong)
+	wallZ(0, 1, 25, 0, 3, yW2, extFront2)
+	wallZ(32, 1, 25, 0, 3, yW2, extBack2)
+	doorAt(32, 13, Y_DOOR2, PI / 2) -- дверь на балкон
+end)
 
 --------------------------------------------------------------------------
 -- 10. Внутренние стены 2 этажа (та же планировка)
 --------------------------------------------------------------------------
 
-wallZ(10, 1, 25, 0, 3, yW2, function(j, k)
-	if (j == 8 or j == 18) and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(j, k)
-end)
-doorAt(10, 8, Y_DOOR2, PI / 2)
-doorAt(10, 18, Y_DOOR2, PI / 2)
+step("intwalls2", function()
+	wallZ(10, 1, 25, 0, 3, yW2, function(j, k)
+		if (j == 8 or j == 18) and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(j, k)
+	end)
+	doorAt(10, 8, Y_DOOR2, PI / 2)
+	doorAt(10, 18, Y_DOOR2, PI / 2)
 
-wallZ(22, 1, 25, 0, 3, yW2, function(j, k)
-	if (j == 8 or j == 18) and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(j, k)
-end)
-doorAt(22, 8, Y_DOOR2, PI / 2)
-doorAt(22, 18, Y_DOOR2, PI / 2)
+	wallZ(22, 1, 25, 0, 3, yW2, function(j, k)
+		if (j == 8 or j == 18) and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(j, k)
+	end)
+	doorAt(22, 8, Y_DOOR2, PI / 2)
+	doorAt(22, 18, Y_DOOR2, PI / 2)
 
-wallX(13, 11, 21, 0, 3, yW2, function(i, k)
-	if i == 16 and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(i, k)
-end)
-doorAt(16, 13, Y_DOOR2, 0)
+	wallX(13, 11, 21, 0, 3, yW2, function(i, k)
+		if i == 16 and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(i, k)
+	end)
+	doorAt(16, 13, Y_DOOR2, 0)
 
-wallX(13, 23, 31, 0, 3, yW2, function(i, k)
-	if (i == 26 or i == 27) and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(i, k)
-end)
+	wallX(13, 23, 31, 0, 3, yW2, function(i, k)
+		if (i == 26 or i == 27) and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(i, k)
+	end)
 
-wallX(6, 1, 9, 0, 3, yW2, function(i, k)
-	if i == 5 and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(i, k)
-end)
-doorAt(5, 6, Y_DOOR2, 0)
+	wallX(6, 1, 9, 0, 3, yW2, function(i, k)
+		if i == 5 and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(i, k)
+	end)
+	doorAt(5, 6, Y_DOOR2, 0)
 
-wallX(20, 1, 9, 0, 3, yW2, function(i, k)
-	if i == 5 and (k == 0 or k == 1) then
-		return nil
-	end
-	return intMat(i, k)
+	wallX(20, 1, 9, 0, 3, yW2, function(i, k)
+		if i == 5 and (k == 0 or k == 1) then
+			return nil
+		end
+		return intMat(i, k)
+	end)
+	doorAt(5, 20, Y_DOOR2, 0)
 end)
-doorAt(5, 20, Y_DOOR2, 0)
 
 --------------------------------------------------------------------------
 -- 11. Чердачное перекрытие
@@ -569,206 +595,229 @@ local function slab3Mat(i: number, j: number)
 	return "Oak Planks"
 end
 
-fill(0, 0, 32, 26, Y_SLAB3, slab3Mat)
+step("floor3", function()
+	fill(0, 0, 32, 26, Y_SLAB3, slab3Mat)
+end)
 
 --------------------------------------------------------------------------
 -- 12. Двускатная кровля (Red Brick Stairs, уклон 45°)
 --     конёк вдоль X (33 клетки), пролёт 27 клеток -> подъём 13 клеток
 --------------------------------------------------------------------------
 
-for k = 0, 13 do
-	local jS = k            -- южный скат: подъём в +Z
-	local jN = 26 - k       -- северный скат: подъём в -Z
-	for i = 0, 32 do
-		if not (i == CH_I and jS == CH_J) then
-			place("Red Brick Stairs", cx(i), yRoof(k), cz(jS), PI / 2)
-		end
-		if jN ~= jS and not (i == CH_I and jN == CH_J) then
-			place("Red Brick Stairs", cx(i), yRoof(k), cz(jN), -PI / 2)
+step("roof", function()
+	for k = 0, 13 do
+		local jS = k            -- южный скат: подъём в +Z
+		local jN = 26 - k       -- северный скат: подъём в -Z
+		for i = 0, 32 do
+			if not (i == CH_I and jS == CH_J) then
+				place("Red Brick Stairs", cx(i), yRoof(k), cz(jS), PI / 2)
+			end
+			if jN ~= jS and not (i == CH_I and jN == CH_J) then
+				place("Red Brick Stairs", cx(i), yRoof(k), cz(jN), -PI / 2)
+			end
 		end
 	end
-end
+end)
 
 --------------------------------------------------------------------------
 -- 13. Фронтоны (треугольные стены на торцах)
 --------------------------------------------------------------------------
 
-for _, iEnd in { 0, 32 } do
-	for k = 0, 12 do
-		for j = k + 1, 25 - k do
-			place("White Brick", cx(iEnd), yRoof(k), cz(j))
+step("gables", function()
+	for _, iEnd in { 0, 32 } do
+		for k = 0, 12 do
+			for j = k + 1, 25 - k do
+				place("White Brick", cx(iEnd), yRoof(k), cz(j))
+			end
 		end
 	end
-end
+end)
 
 --------------------------------------------------------------------------
 -- 14. Камин: сквозной колодец в (28, 6)
 --------------------------------------------------------------------------
 
-place("Stone Bricks", cx(CH_I), Y_FLOOR, cz(CH_J))
-for k = 0, 3 do
-	place("Stone Bricks", cx(CH_I), yW1(k), cz(CH_J))
-end
-place("Stone Bricks", cx(CH_I), Y_SLAB2, cz(CH_J))
-for k = 0, 3 do
-	place("Stone Bricks", cx(CH_I), yW2(k), cz(CH_J))
-end
-place("Stone Bricks", cx(CH_I), Y_SLAB3, cz(CH_J))
-for k = 0, 9 do
-	place("Stone Bricks", cx(CH_I), yRoof(k), cz(CH_J))
-end
+step("chimney", function()
+	place("Stone Bricks", cx(CH_I), Y_FLOOR, cz(CH_J))
+	for k = 0, 3 do
+		place("Stone Bricks", cx(CH_I), yW1(k), cz(CH_J))
+	end
+	place("Stone Bricks", cx(CH_I), Y_SLAB2, cz(CH_J))
+	for k = 0, 3 do
+		place("Stone Bricks", cx(CH_I), yW2(k), cz(CH_J))
+	end
+	place("Stone Bricks", cx(CH_I), Y_SLAB3, cz(CH_J))
+	for k = 0, 9 do
+		place("Stone Bricks", cx(CH_I), yRoof(k), cz(CH_J))
+	end
+end)
 
 --------------------------------------------------------------------------
 -- 15. Крыльцо: терраса, колонны, фонари, навес, ступени
 --------------------------------------------------------------------------
 
-fill(-4, 9, -1, 17, Y_FLOOR, "Stone Bricks") -- терраса
+step("porch", function()
+	fill(-4, 9, -1, 17, Y_FLOOR, "Stone Bricks") -- терраса
 
-for _, j in { 11, 15 } do                    -- колонны портика
-	for k = 0, 3 do
-		place("Quartz", cx(-1), yW1(k), cz(j))
+	for _, j in { 11, 15 } do                    -- колонны портика
+		for k = 0, 3 do
+			place("Quartz", cx(-1), yW1(k), cz(j))
+		end
 	end
-end
 
-place("Lamp", cx(-1), yW1(0), cz(12)) -- фонари у двери
-place("Lamp", cx(-1), yW1(0), cz(14))
+	place("Lamp", cx(-1), yW1(0), cz(12)) -- фонари у двери
+	place("Lamp", cx(-1), yW1(0), cz(14))
 
-fill(-1, 11, -1, 15, Y_SLAB2, "Quartz") -- навес
+	fill(-1, 11, -1, 15, Y_SLAB2, "Quartz") -- навес
 
-for j = 9, 17 do                         -- ступени с террасы
-	place("Stone Stairs", cx(-5), Y_FLOOR, cz(j), PI)
-end
+	for j = 9, 17 do                         -- ступени с террасы
+		place("Stone Stairs", cx(-5), Y_FLOOR, cz(j), PI)
+	end
+end)
 
 --------------------------------------------------------------------------
 -- 16. Балкон на восточном торце (2 этаж)
 --------------------------------------------------------------------------
 
-fill(33, 10, 34, 16, Y_SLAB2, "Stone Bricks")
-for j = 10, 16 do
-	place("Quartz", cx(34), yW2(0), cz(j))
-end
-place("Quartz", cx(33), yW2(0), cz(10))
-place("Quartz", cx(33), yW2(0), cz(16))
+step("balcony", function()
+	fill(33, 10, 34, 16, Y_SLAB2, "Stone Bricks")
+	for j = 10, 16 do
+		place("Quartz", cx(34), yW2(0), cz(j))
+	end
+	place("Quartz", cx(33), yW2(0), cz(10))
+	place("Quartz", cx(33), yW2(0), cz(16))
+end)
 
 --------------------------------------------------------------------------
 -- 17. Мебель и свет — 1 этаж
 --------------------------------------------------------------------------
 
--- холл
-place("Lamp", cx(1), Y_F1, cz(7))
-place("Lamp", cx(9), Y_F1, cz(19))
-place("Table", cx(2), Y_F1, cz(17))
+step("furniture1", function()
+	-- холл
+	place("Lamp", cx(1), Y_F1, cz(7))
+	place("Lamp", cx(9), Y_F1, cz(19))
+	place("Table", cx(2), Y_F1, cz(17))
 
--- кабинет (i=1..9, j=1..5)
-place("Table", cx(4), Y_F1, cz(3))
-place("Chair", cx(4), Y_F1, cz(5), PI)
-place("BookShelf", cx(1), Y_F1, cz(2))
-place("Lamp", cx(9), Y_F1, cz(4))
+	-- кабинет (i=1..9, j=1..5)
+	place("Table", cx(4), Y_F1, cz(3))
+	place("Chair", cx(4), Y_F1, cz(5), PI)
+	place("BookShelf", cx(1), Y_F1, cz(2))
+	place("Lamp", cx(9), Y_F1, cz(4))
 
--- санузел / кладовая (i=1..9, j=21..25)
-place("Lamp", cx(2), Y_F1, cz(22))
-place("Crate", cx(8), Y_F1, cz(24))
+	-- санузел / кладовая (i=1..9, j=21..25)
+	place("Lamp", cx(2), Y_F1, cz(22))
+	place("Crate", cx(8), Y_F1, cz(24))
 
--- гостиная (i=11..21, j=1..12)
-place("Table", cx(16), Y_F1, cz(6))
-place("Armchair", cx(16), Y_F1, cz(8), PI)
-place("Armchair", cx(13), Y_F1, cz(6), PI / 2)
-place("Armchair", cx(19), Y_F1, cz(6), -PI / 2)
-place("BookShelf", cx(11), Y_F1, cz(2))
-place("Lamp", cx(21), Y_F1, cz(11))
+	-- гостиная (i=11..21, j=1..12)
+	place("Table", cx(16), Y_F1, cz(6))
+	place("Armchair", cx(16), Y_F1, cz(8), PI)
+	place("Armchair", cx(13), Y_F1, cz(6), PI / 2)
+	place("Armchair", cx(19), Y_F1, cz(6), -PI / 2)
+	place("BookShelf", cx(11), Y_F1, cz(2))
+	place("Lamp", cx(21), Y_F1, cz(11))
 
--- столовая (i=11..21, j=14..25)
-place("Table", cx(16), Y_F1, cz(20))
-place("Chair", cx(16), Y_F1, cz(22), PI)
-place("Chair", cx(16), Y_F1, cz(18), 0)
-place("Chair", cx(14), Y_F1, cz(20), PI / 2)
-place("Chair", cx(18), Y_F1, cz(20), -PI / 2)
-place("Lamp", cx(11), Y_F1, cz(25))
+	-- столовая (i=11..21, j=14..25)
+	place("Table", cx(16), Y_F1, cz(20))
+	place("Chair", cx(16), Y_F1, cz(22), PI)
+	place("Chair", cx(16), Y_F1, cz(18), 0)
+	place("Chair", cx(14), Y_F1, cz(20), PI / 2)
+	place("Chair", cx(18), Y_F1, cz(20), -PI / 2)
+	place("Lamp", cx(11), Y_F1, cz(25))
 
--- библиотека (i=23..31, j=1..12)
-place("BookShelf", cx(31), Y_F1, cz(1))
-place("BookShelf", cx(31), Y_F1, cz(2))
-place("BookShelf", cx(23), Y_F1, cz(12))
-place("Armchair", cx(27), Y_F1, cz(8), 0)
-place("Lamp", cx(24), Y_F1, cz(1))
+	-- библиотека (i=23..31, j=1..12)
+	place("BookShelf", cx(31), Y_F1, cz(1))
+	place("BookShelf", cx(31), Y_F1, cz(2))
+	place("BookShelf", cx(23), Y_F1, cz(12))
+	place("Armchair", cx(27), Y_F1, cz(8), 0)
+	place("Lamp", cx(24), Y_F1, cz(1))
 
--- кухня-столовая (i=23..31, j=14..25)
-place("Table", cx(27), Y_F1, cz(20))
-place("Chair", cx(27), Y_F1, cz(22), PI)
-place("Chair", cx(27), Y_F1, cz(18), 0)
-place("Chair", cx(25), Y_F1, cz(20), PI / 2)
-place("Chair", cx(29), Y_F1, cz(20), -PI / 2)
-place("Crate", cx(31), Y_F1, cz(14))
-place("Crate", cx(31), Y_F1, cz(15))
-place("Lamp", cx(24), Y_F1, cz(25))
+	-- кухня-столовая (i=23..31, j=14..25)
+	place("Table", cx(27), Y_F1, cz(20))
+	place("Chair", cx(27), Y_F1, cz(22), PI)
+	place("Chair", cx(27), Y_F1, cz(18), 0)
+	place("Chair", cx(25), Y_F1, cz(20), PI / 2)
+	place("Chair", cx(29), Y_F1, cz(20), -PI / 2)
+	place("Crate", cx(31), Y_F1, cz(14))
+	place("Crate", cx(31), Y_F1, cz(15))
+	place("Lamp", cx(24), Y_F1, cz(25))
+end)
 
 --------------------------------------------------------------------------
 -- 18. Мебель и свет — 2 этаж (6 комнат)
 --------------------------------------------------------------------------
 
--- площадка лестницы
-place("Lamp", cx(1), Y_F2, cz(7))
-place("Lamp", cx(9), Y_F2, cz(19))
-place("BookShelf", cx(9), Y_F2, cz(17))
+step("furniture2", function()
+	-- площадка лестницы
+	place("Lamp", cx(1), Y_F2, cz(7))
+	place("Lamp", cx(9), Y_F2, cz(19))
+	place("BookShelf", cx(9), Y_F2, cz(17))
 
--- спальня запад-север
-place("Bed", cx(3), Y_F2, cz(1) + 1.5, 0)
-place("Lamp", cx(8), Y_F2, cz(4))
+	-- спальня запад-север
+	place("Bed", cx(3), Y_F2, cz(1) + 1.5, 0)
+	place("Lamp", cx(8), Y_F2, cz(4))
 
--- спальня запад-юг
-place("Bed", cx(3), Y_F2, cz(24) + 1.5, PI)
-place("Lamp", cx(8), Y_F2, cz(22))
+	-- спальня запад-юг
+	place("Bed", cx(3), Y_F2, cz(24) + 1.5, PI)
+	place("Lamp", cx(8), Y_F2, cz(22))
 
--- спальня средняя-север
-place("Bed", cx(14), Y_F2, cz(1) + 1.5, 0)
-place("Table", cx(20), Y_F2, cz(11))
-place("Lamp", cx(11), Y_F2, cz(12))
+	-- спальня средняя-север
+	place("Bed", cx(14), Y_F2, cz(1) + 1.5, 0)
+	place("Table", cx(20), Y_F2, cz(11))
+	place("Lamp", cx(11), Y_F2, cz(12))
 
--- спальня средняя-юг
-place("Bed", cx(18), Y_F2, cz(24) + 1.5, PI)
-place("Lamp", cx(11), Y_F2, cz(15))
+	-- спальня средняя-юг
+	place("Bed", cx(18), Y_F2, cz(24) + 1.5, PI)
+	place("Lamp", cx(11), Y_F2, cz(15))
 
--- ванная (восток-север)
-place("Lamp", cx(24), Y_F2, cz(2))
-place("Crate", cx(31), Y_F2, cz(1))
-place("BookShelf", cx(23), Y_F2, cz(12))
+	-- ванная (восток-север)
+	place("Lamp", cx(24), Y_F2, cz(2))
+	place("Crate", cx(31), Y_F2, cz(1))
+	place("BookShelf", cx(23), Y_F2, cz(12))
 
--- спальня восток-юг
-place("Bed", cx(27), Y_F2, cz(24) + 1.5, PI)
-place("Table", cx(31), Y_F2, cz(16))
-place("Lamp", cx(23), Y_F2, cz(15))
+	-- спальня восток-юг
+	place("Bed", cx(27), Y_F2, cz(24) + 1.5, PI)
+	place("Table", cx(31), Y_F2, cz(16))
+	place("Lamp", cx(23), Y_F2, cz(15))
+end)
 
 --------------------------------------------------------------------------
 -- 19. Участок: дорожка, кусты, цветы, фонари
 --------------------------------------------------------------------------
 
-for i = -6, -14, -1 do
-	place("Smooth Stone", cx(i), FY - 1.5, cz(13)) -- дорожка в уровень земли
-end
-
-place("Lamp", cx(-7), Y_FLOOR, cz(11))
-place("Lamp", cx(-7), Y_FLOOR, cz(15))
-
-for _, j in { -2, 28 } do
-	for _, i in { 5, 16, 27 } do
-		place("Oak Leaves", cx(i), Y_FLOOR, cz(j))
+step("land", function()
+	for i = -6, -14, -1 do
+		place("Smooth Stone", cx(i), FY - 1.5, cz(13)) -- дорожка в уровень земли
 	end
-	for _, i in { 8, 13, 20, 25 } do
-		place(if (i + j) % 2 == 0 then "Rose Flower" else "Dandelion Flower", cx(i), Y_FLOOR, cz(j))
-	end
-end
 
-for _, i in { -8, 40 } do
-	for _, j in { 6, 20 } do
-		place("Oak Leaves", cx(i), Y_FLOOR, cz(j))
+	place("Lamp", cx(-7), Y_FLOOR, cz(11))
+	place("Lamp", cx(-7), Y_FLOOR, cz(15))
+
+	for _, j in { -2, 28 } do
+		for _, i in { 5, 16, 27 } do
+			place("Oak Leaves", cx(i), Y_FLOOR, cz(j))
+		end
+		for _, i in { 8, 13, 20, 25 } do
+			place(if (i + j) % 2 == 0 then "Rose Flower" else "Dandelion Flower", cx(i), Y_FLOOR, cz(j))
+		end
 	end
-end
+
+	for _, i in { -8, 40 } do
+		for _, j in { 6, 20 } do
+			place("Oak Leaves", cx(i), Y_FLOOR, cz(j))
+		end
+	end
+end)
 
 --------------------------------------------------------------------------
 -- 20. Итог
 --------------------------------------------------------------------------
 
-drain() -- дождаться достройки последних блоков перед отчётом
-
-print(("[Mansion] ГОТОВО. Блоков: %d, недостижимых точек: %d, ошибок отправки: %d")
-	:format(placed, bad, failed))
+print(("[Mansion] ГОТОВО: отправлено=%d успешно=%d ошибок=%d недостижимых=%d")
+	:format(sent, okCount, failCount, bad))
+pcall(function()
+	if IS_FUNC then
+		Change:InvokeServer("MansionDone")
+	else
+		Change:FireServer("MansionDone")
+	end
+end)
