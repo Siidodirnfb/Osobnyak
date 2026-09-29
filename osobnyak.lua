@@ -25,6 +25,56 @@ local PI = math.pi
 local TARGET_NAME = "Prime_Neuer"
 
 --------------------------------------------------------------------------
+-- 0. Параллельные вызовы ремоута (семафор)
+--------------------------------------------------------------------------
+-- Change — это RemoteFunction: каждый InvokeServer усыпляет свою корутину
+-- до ответа сервера, то есть время последовательного цикла = N x RTT.
+-- При 4000 блоках и RTT 100 мс это ~7 минут. Семафор держит до
+-- MAX_IN_FLIGHT вызовов в полёте одновременно: волна уходит в сеть за один
+-- тик, а round-trips накладываются друг на друга вместо суммирования.
+-- Выигрыш ~= MAX_IN_FLIGHT раз.
+--
+-- Если сервер начнёт рate-лимитить или кикать за спам — опусти константу:
+-- 64 -> 32 -> 16. Больше в скрипте ничего крутить не нужно.
+
+local MAX_IN_FLIGHT = 64
+local inFlight = 0
+local failed = 0
+local slot = Instance.new("BindableEvent")
+
+--- Отправляет блок и сразу возвращает управление: ждёт только свободного
+--- слота, а не ответа сервера на этот конкретный блок.
+local function invokePlace(hitPos: Vector3, cameraCFrame: CFrame, name: string)
+	while inFlight >= MAX_IN_FLIGHT do
+		slot.Event:Wait()
+	end
+
+	inFlight += 1
+	task.spawn(function()
+		-- pcall обязателен: упавший вызов иначе никогда не декрементирует
+		-- счётчик и весь скрипт зависнет молча на очередном слоте.
+		local ok, err = pcall(function()
+			Change:InvokeServer("Place", hitPos, cameraCFrame, name, NORMAL, "H", nil)
+		end)
+		if not ok then
+			failed += 1
+			if failed <= 5 then
+				warn(("[Mansion] вызов ремоута упал: %s"):format(tostring(err)))
+			end
+		end
+		inFlight -= 1
+		slot:Fire()
+	end)
+end
+
+--- Ждёт, пока сервер ответит на все уже отправленные блоки.
+local function drain()
+	while inFlight > 0 do
+		slot.Event:Wait()
+	end
+end
+
+--------------------------------------------------------------------------
 -- 1. Математика сетки (обратная к логике сервера)
 --------------------------------------------------------------------------
 
@@ -61,7 +111,7 @@ end
 local placed = 0
 local bad = 0
 
---- Один вызов ремоута = один блок.
+--- Один блок = один вызов ремоута, но асинхронный (см. семафор в п. 0).
 local function place(name: string, x: number, y: number, z: number, yaw: number?)
 	yaw = yaw or 0
 	local H, D = dims(name)
@@ -93,14 +143,11 @@ local function place(name: string, x: number, y: number, z: number, yaw: number?
 		end
 	end
 
-	Change:InvokeServer("Place", hitPos, cameraCFrame, name, NORMAL, "H", nil)
+	invokePlace(hitPos, cameraCFrame, name)
 
 	placed += 1
-	if placed % 50 == 0 then
-		task.wait()
-	end
 	if placed % 500 == 0 then
-		print(("[Mansion] %d блоков..."):format(placed))
+		print(("[Mansion] %d блоков... (%d в полёте)"):format(placed, inFlight))
 	end
 end
 
@@ -110,7 +157,7 @@ end
 
 local lp = Players.LocalPlayer
 
-local function waitForCharacter(player: Player?, timeout: number): Model?
+local function waitForCharacter(player: any, timeout: number): Model?
 	if player == nil then
 		return nil
 	end
@@ -125,20 +172,31 @@ local function waitForCharacter(player: Player?, timeout: number): Model?
 end
 
 local target = Players:FindFirstChild(TARGET_NAME)
-local char = waitForCharacter(target, 20) or waitForCharacter(lp, 10)
+local char: Model? = waitForCharacter(target, 20) or waitForCharacter(lp, 10)
 if not char then
 	error("[Mansion] персонаж не найден — скрипт остановлен")
 end
 
-local hrp = char:WaitForChild("HumanoidRootPart", 10)
+local hrp: BasePart? = char:WaitForChild("HumanoidRootPart", 10) :: BasePart?
 if not hrp then
-	char = waitForCharacter(lp, 10) :: Model
-	hrp = char:WaitForChild("HumanoidRootPart")
+	local alt: Model? = waitForCharacter(lp, 10)
+	if alt then
+		hrp = alt:WaitForChild("HumanoidRootPart") :: BasePart?
+	end
+end
+if not hrp then
+	error("[Mansion] HumanoidRootPart не найден — скрипт остановлен")
+end
+
+local exclude: { Instance } = { char }
+local myChar = lp.Character
+if myChar and myChar ~= char then
+	table.insert(exclude, myChar)
 end
 
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
-rayParams.FilterDescendantsInstances = { char }
+rayParams.FilterDescendantsInstances = exclude
 
 local ray = workspace:Raycast(hrp.Position + Vector3.new(0, 4, 0), Vector3.new(0, -90, 0), rayParams)
 local feetY = if ray then ray.Position.Y else hrp.Position.Y - 3
@@ -357,7 +415,7 @@ wallX(13, 23, 31, 0, 3, yW1, function(i, k)
 	return intMat(i, k)
 end)
 
--- перегородки западного блока (кабинет / санузел)
+-- перегородки западного блоке (кабинет / санузел)
 wallX(6, 1, 9, 0, 3, yW1, function(i, k)
 	if i == 5 and (k == 0 or k == 1) then
 		return nil
@@ -684,11 +742,8 @@ place("Lamp", cx(23), Y_F2, cz(15))
 -- 19. Участок: дорожка, кусты, цветы, фонари
 --------------------------------------------------------------------------
 
-for i = -6, -14 do
-	place("Smooth Stone", cx(i), Y_FLOOR, cz(13))
-end
-for j = 12, 14 do
-	place("Stone Stairs", cx(-15), Y_FLOOR, cz(j), 0)
+for i = -6, -14, -1 do
+	place("Smooth Stone", cx(i), FY - 1.5, cz(13)) -- дорожка в уровень земли
 end
 
 place("Lamp", cx(-7), Y_FLOOR, cz(11))
@@ -713,4 +768,7 @@ end
 -- 20. Итог
 --------------------------------------------------------------------------
 
-print(("[Mansion] ГОТОВО. Блоков: %d, недостижимых точек: %d"):format(placed, bad))
+drain() -- дождаться достройки последних блоков перед отчётом
+
+print(("[Mansion] ГОТОВО. Блоков: %d, недостижимых точек: %d, ошибок отправки: %d")
+	:format(placed, bad, failed))
